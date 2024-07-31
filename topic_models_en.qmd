@@ -233,6 +233,7 @@ vocab <- dfm_stm$vocab
 
 ## Topic model
 As said in the introduction, a topic model describes how both documents and terms are generated from topics. Whether you use LDA, correlated topic models or structural topic models, each document is assumed to be a mixture of different topics, and the chosen model has to estimate two matrices simultaneously:
+
 - a matrix of per-term-per-topic probabilities $\beta$ (or word-topic matrix); i.e. the conditional probability of a term (or word) appearing within a specific topic
 - a matrix of per-document-per-topic probabilities $\gamma$ (or document-topic matrix); i.e. the conditional probability (or proportion) of a topic within a specific document
 
