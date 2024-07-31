@@ -1,0 +1,533 @@
+---
+title: "Topic Models"
+subtitle: "Case study: Telegram Geschwurbel"
+author: "Andreas Blombach"
+date: last-modified
+date-format: long
+format:
+  html:
+    self-contained: true
+    toc: true
+    toc-depth: 3
+    code-fold: false
+    code-tools: true
+    theme: yeti
+    df-print: paged
+    fig-width: 8
+    fig-height: 5
+    link-external-icon: true
+---
+
+## Introduction
+A topic model is a probabilistic model that describes how documents are generated from a given number of topics and how words (or terms) are generated from these topics. In practice, it allows us to find latent (underlying) topics (i.e. clusters of words) in a corpus of many documents -- which may help us to get an overview of the documents' content and its distribution. It also allows us to contrast different types of documents according to their metadata: Are certain topics more prevalent in documents belonging to a specific source (e.g. different media, political parties)? Since topic modeling is a method that reduces the dimensionality of the data (where before you had hundreds or thousands of different words and their frequencies, you now have only a handful of topics), it can also be useful as a preparatory step for supervised machine learning.
+
+Different approaches to topic modelling exist, as well as different implementations in various libraries. To list just some of them:
+
+- [Latent Dirichlet allocation](https://en.wikipedia.org/wiki/Latent_Dirichlet_allocation) (LDA) is perhaps the most widely used method.
+- Correlated topic models (CTMs, [Blei and Lafferty 2006](http://papers.neurips.cc/paper/2906-correlated-topic-models.pdf)) are an extension of LDA which relaxes the assumption of independence of topics (so that topics can be correlated). This is often a more realistic assumption, as we'd expect the existence of at least some related topics which co-occur quite often.
+- [Structural topic models](https://www.structuraltopicmodel.com) (STMs) are an extension of CTMs that allow the inclusion of document-level metadata. More on that later.
+- [Gensim](https://radimrehurek.com/gensim/) is probably the default library for Python. Several algorithms for topic modelling are implemented, e.g. LDA or Hierarchical Dirichlet Process (HDP).
+- Keyword-assisted topic models, available via the R package [keyATM](https://keyatm.github.io/keyATM/) find some or all topics based on a few user-defined keywords (potentially very useful if you're interested in more specific topics).
+- [BERTopic](https://maartengr.github.io/BERTopic/index.html) (Python) is a flexible approach to topic modelling that leverages transformers and their better grasp of semantics.
+
+Here, we'll try our hand at a structural topic model for Telegram posts made in conspiracy or conspiracy-adjacent channels and chat groups during the Corona crisis.
+
+## Setup
+```{r}
+#| message: false
+library(tidyverse)
+library(reticulate)
+library(quanteda)
+library(tidytext)
+library(stm)
+```
+
+First things first. We'll need to:
+
+- read in the data
+- clean it
+- tokenise all texts
+- optionally annotate them (e.g. POS tagging)
+- remove unneeded or unwanted tokens (both rare and ubiquitous terms)
+- construct a document-term matrix
+- construct a topic model
+- evaluate and interpret it
+- possibly repeat/adjust some of the above steps to arrive at a better model
+
+### Data
+We'll use our Telegram sample:
+```{r}
+#| message: false
+train <- read_csv("data/geschwurbel/train.csv")
+dev <- read_csv("data/geschwurbel/dev.csv")
+test <- read_csv("data/geschwurbel/test.csv")
+```
+
+New column: `Geschwurbel` as a factor (`ja` or `nein`):
+```{r}
+train <- train |> mutate(Geschwurbel = factor(kein_Geschwurbel, labels = c("ja", "nein")))
+dev <- dev |> mutate(Geschwurbel = factor(kein_Geschwurbel, labels = c("ja", "nein")))
+test <- test |> mutate(Geschwurbel = factor(kein_Geschwurbel, labels = c("ja", "nein")))
+```
+
+Since we're not doing supervised learning here, let's combine all three datasets into one:
+```{r}
+all <- bind_rows(train, dev, test) |>
+  select(id, channel, Geschwurbel, text) |>
+  arrange(id)
+```
+
+Normalise text in one weird post:
+```{r}
+all |> filter(id == 645) |> pull(text)
+
+all <- all |>
+  mutate(text = ifelse(id == 645, stringi::stri_trans_nfkc(text), text))
+
+all |> filter(id == 645) |> pull(text)
+```
+
+Unescape XML entities (e.g. `&amp;` -> `&`):
+```{r}
+unescape_xml <- Vectorize(function(str){
+  xml2::xml_text(xml2::read_xml(paste0("<x>", str, "</x>")))
+})
+
+all <- all |>
+  mutate(text = unescape_xml(text))
+```
+
+Replace all URLs with the string "URL":
+```{r}
+#| message: false
+tlds <- read_csv("https://data.iana.org/TLD/tlds-alpha-by-domain.txt", col_names = "tld", skip = 1) # list of current top-level domains (like .com, .de or .org)
+tlds <- tlds |>
+  mutate(tld = str_to_lower(tld)) |>
+  filter(!str_detect(tld, "^xn--"))
+tld_re <- tlds$tld |> str_flatten("|")
+
+all <- all |>
+  mutate(
+    text = str_replace_all(
+      text,
+      regex(
+        str_c(
+          r"(\b(https?://)?(www\.)?(\w[\w-]*\.)*?(\w[\w-]*\.)()",
+          tld_re,
+          r"()(/\S*)?(?=\s|[.!?]|$))"
+        ),
+        ignore_case = TRUE
+      ),
+      "URL"
+    )
+  )
+```
+
+
+### Tokenisation and tagging in Python
+We could tokenise and tag everything in R, as we've done before. This time, though, let's use Python instead.
+
+Quarto supports code chunks in different languages -- so including Python code is easy. You need to configure your Python interpreter in your global or project settings, however!
+
+To access R objects in Python and vice versa, the `reticulate` package is used. To access an object from your R environment, simply use `r.` in front of its name (data.frames/tibbles are automatically converted to pandas-DataFrames). Likewise, to access Python objects in R, we'll use `py$`.
+```{python}
+df = r.all
+
+df
+```
+
+Now that we have the data in Python, we can use [SoMaJo](https://github.com/tsproisl/SoMaJo) to tokenise our texts. We'll also use [SoMeWeTa](https://github.com/tsproisl/SoMeWeTa) to assign POS tags to each token. (Of course, we could also use [Trankit](https://github.com/nlp-uoregon/trankit), [Stanza](https://stanfordnlp.github.io/stanza) or [spaCy](https://spacy.io) to tokenise and annotate our data instead.)
+```{python}
+import pandas as pd
+from somajo import SoMaJo
+import someweta
+
+model = "data/german_cmc_wo_ono_2021-04-06.model"
+asptagger = someweta.ASPTagger()
+asptagger.load(model) # may take some time
+
+tokenizer = SoMaJo("de_CMC") # model for German web and social media text
+
+def annotate(text_column: pd.Series) -> tuple[list, list]:
+  token_list = []
+  tag_list = []
+  
+  for text in text_column:
+    text = text.strip()
+    sentences = tokenizer.tokenize_text(text.split("\n\n")) # tokenize_text expects a list of paragraphs
+    # tokens = [token.text for s in sentences for token in s]
+    
+    s_tokens = []
+    s_tags = []
+    
+    for sentence in sentences:
+      tokens = [token.text for token in sentence]
+      tagged_sentence = asptagger.tag_sentence(tokens)
+      tags = [tag for token, tag in tagged_sentence]
+      s_tokens.append(tokens)
+      s_tags.append(tags)
+      
+    token_list.append(s_tokens)
+    tag_list.append(s_tags)
+    
+  return(token_list, tag_list)
+
+
+df["tokens"], df["tags"] = annotate(df["text"])
+```
+
+The result can now be used in R. The new columns are lists of lists, however (since texts contain sentences which contain individual tokens).
+```{r}
+py$df |> select(-text)
+```
+To unpack these lists, we can use `unnest()`:
+```{r}
+all_tagged <- py$df |>
+  select(id, channel, tokens, tags) |>
+  unnest(cols = tokens:tags) |> # unnest texts
+  mutate(sid = 1:n(), .by = "id") |> # add sentence ids by text
+  unnest(cols = tokens:tags) |> # unnest sentences within texts
+  select(id, channel, sid, token = tokens, pos = tags)
+all_tagged
+```
+
+### Filtering
+We can now filter by POS tags -- since we're only interested in content words, we'll only keep nouns, adjectives and lexical verbs. (We could also include *TRUNC* for truncated words.) Since hashtags can be considered content words as well, we'll include these, too (but we'll remove the hash symbols).
+
+If we also want to include words tagged *FM* (foreign material, in our case usually English), we should use a stopword list.
+```{r}
+all_tagged_filtered <- all_tagged |>
+  filter(str_detect(pos, "^(N.|ADJ.|VV.+|HST|EMO(ASC|IMG))$") | (pos == "FM" & !token %in% stopwords::stopwords("en"))) |>
+  filter(!str_detect(token, r"(^(URL|[[:alpha:]]\.|[[:punct:]0-9]+)$)")) |>
+  mutate(token = str_remove(token, "(^[-#])|(-$)") |> str_to_lower())
+all_tagged_filtered
+```
+
+### Document-term matrix
+The input for most topic models is a document-term matrix (DTM). Luckily, we know how to create these by now.
+
+A DTM can come in different formats in R. `tidytext` provides several functions for these: `cast_sparse()` creates a sparse matrix from the `Matrix` package, `cast_dtm()` creates a DTM from the `tm` package (the required input for `topicmodels::LDA()` and `topicmodels::CTM()`), and `cast_dfm()` creates a DTM from the `quanteda` package. The function for structural topic models which we're going to use (`stm()`) works with either a sparse matrix, a `quanteda` DTM or its own preferred format -- we can use `quanteda::convert(to = "stm")` for this.
+```{r}
+counts <- all_tagged_filtered |>
+  count(id, token) |>
+  add_count(token, name = "df")
+
+# Trimming:
+counts <- counts |>
+  filter(df <= .5 * nrow(all), # exclude tokens occurring in over 50% of documents
+         df > .01 * nrow(all)) # exclude tokens occurring in under 1% of documents (if we had lemmatised our texts, we could keep more of the important terms)
+
+# Sparse matrix:
+dfm <- counts |>
+  cast_sparse(id, token, n)
+
+# If you want stm's format (useful for some functions):
+dfm_stm <- counts |>
+  cast_dfm(id, token, n) |>
+  quanteda::convert(to = "stm")
+docs <- dfm_stm$documents
+vocab <- dfm_stm$vocab
+```
+
+
+
+## Topic model
+As said in the introduction, a topic model describes how both documents and terms are generated from topics. Whether you use LDA, correlated topic models or structural topic models, each document is assumed to be a mixture of different topics, and the chosen model has to estimate two matrices simultaneously:
+- a matrix of per-term-per-topic probabilities $\beta$ (or word-topic matrix); i.e. the conditional probability of a term (or word) appearing within a specific topic
+- a matrix of per-document-per-topic probabilities $\gamma$ (or document-topic matrix); i.e. the conditional probability (or proportion) of a topic within a specific document
+
+
+Instead of the standard topic modelling library `topicmodels`, we'll use `stm`, a package for structural topic models (see [Roberts et al. 2019](https://github.com/bstewart/stm/blob/master/vignettes/stmVignette.pdf?raw=true), which is also the package vignette). This allows us to factor document metadata into the model, e.g. interesting groups of documents. As the authors put it (p. 2):
+
+> The goal of the structural topic model is to allow researchers to discover topics and estimate their relationship to document metadata. Outputs of the model can be used to conduct hypothesis testing about these relationships.
+
+STMs allow covariates, namely *topical prevalence covariates* (i.e. metadata that explain how much of a document is associated with a specific topic or how often a topic is discussed) and *topical content covariates* (i.e. metadata that explain which words are used within a topic or how it is discussed). An STM without such covariates is basically a correlated topic model (CTM).
+
+The downside of STMs is that they are computationally more expensive -- so you may run into trouble when using large amounts of documents with a huge vocabulary (you can always thin your document-term matrix, of course).
+
+
+### Covariates
+In our case, we only have the channel names as additional metadata (we *could* also use the manual classification, but that doesn't seem right for an unsupervised approach):
+```{r}
+covariates <- all |>
+  select(id, channel, Geschwurbel) |>
+  filter(id %in% counts$id) # make sure to include only the remaining documents
+```
+
+### Structural topic model
+For the actual model, we'll need `stm()`. This function's main input is a document-term matrix (in our case, a sparse matrix, but you can also use `stm`'s native format or a `dfm` object from the `quanteda` package). The most important model parameter is the number of topics `K` -- the higher you set this, the more fine-grained the topics will be. There are no general rules on how to determine the "right" number of topics. It depends on the number of documents in the corpus, their lengths and their expected similarity. For example, you should expect whole novels to include many more different topics than short tweets. Similarly, a high number of topics is likely appropriate for a corpus of thousands upon thousands of documents, whereas fewer than 20 topics may suffice for a few houndred documents. *This is a matter of experimentation.*
+
+You can also supply metadata via the `data` argument and tell the model which of the metadata variables to use as predictors for topical prevalence (argument `prevalence`) and/or topical content (argument `content`). `init.type = "Spectral"` makes the model deterministic (you'll always get the same result). Instead, you can also use `"LDA"` for non-deterministic initialisation (to make the results reproducible, you can then set the `seed` parameter to a number of your choice).
+
+If you use the spectral algorithm and set `K` to 0, the number of topics is estimated automatically (requires the following packages to be installed: `Rtsne`, `rsvd` and `geometry`). While this probably won't provide an "ideal" solution, it may be a good place to start. (For our data here, we'd get 48 topics, which seems a little excessive.)
+```{r}
+schwurbel_stm <- stm(documents = docs,
+                     vocab = vocab, # instead of documents and vocab, a single sparse matrix or quanteda dfm is also possible
+                     K = 16, # number of topics
+                     data = covariates,
+                     prevalence = ~ channel,
+                     verbose = FALSE,
+                     init.type = "Spectral")
+```
+
+### Topics
+To get an overview of the topics, we can use the `summary()` function (or `labelTopics()`):
+```{r}
+summary(schwurbel_stm)
+```
+
+Now, what's what?
+
+- `Highest Prob`: words that were assigned the highest probabilities $\beta$ of belonging to the topic
+- `FREX`: words within a topic that are both frequent and exclusive to this topic (see documentation for `calcfrex()`)
+- `Lift` and `Score`: similar to `FREX`, words that are important for this topic, but less important for others (see documentation for `calclift()` and `calcscore()`)
+
+Ideally, these words should help you to interpret the topics in a meaningful way.
+
+
+Instead of relying on `summary()`, you can also extract the per-term-per-topic probabilities $\beta$ ("beta") directly, using `tidytext`'s `tidy()` function (or, alternatively, FREX or lift words, using `matrix = "frex"` or `matrix = "lift"`):
+```{r}
+tidy(schwurbel_stm) |>
+  arrange(topic, desc(beta))
+```
+This allows for nice ggplot visualisations:
+```{r, fig.width=10}
+tidy(schwurbel_stm) |>
+  group_by(topic) |>
+  slice_max(beta, n = 10) |>
+  ungroup() |>
+  ggplot(aes(beta, reorder_within(term, by = beta, within = topic))) +
+  geom_col() +
+  scale_y_reordered() +
+  facet_wrap(vars(topic), scales = "free", labeller = label_both) +
+  labs(x = expression(beta),
+       y = "term")
+```
+
+If you really want to, you can also visualise individual topics with word clouds:
+```{r, fig.width=11}
+cloud(schwurbel_stm, topic = 5)
+```
+
+
+Which texts are most representative for given topics? Again, you can use the `tidy()` function to extract per-document-per-topic probabilities $\gamma$ ("gamma"; `stm` calls this $\theta$, "theta"); if these are grouped by topic and arranged by value, you can use them to find the documents most highly associated with individual topics. Let's have a look at topic 5, for example:
+```{r}
+tidy(schwurbel_stm, matrix = "gamma",
+     document_names = covariates$id) |>
+  filter(topic == 5) |>
+  arrange(desc(gamma))
+```
+
+`stm`'s `findThoughts()` function does the same thing, but instead of document names, it gives you the `n` most highly associated texts for each topic in a vector of topics. This allows you to check if your interpretation of a topic's content based on its top terms is valid.
+```{r}
+findThoughts(schwurbel_stm, topics = c(5, 9), meta = covariates, texts = all |> filter(id %in% counts$id) |> pull(text), n = 3)
+```
+
+
+The `stm` package has its own plot function (`?plot.STM`) which is quite versatile. By default, it shows the topics arranged by their (expected) relative frequency in the corpus:
+```{r}
+plot(schwurbel_stm, labeltype = "frex")
+```
+
+Setting `type` to `"perspectives"`, we can contrast two topics by their `n` most important words:
+```{r, fig.width=12}
+plot(schwurbel_stm, type = "perspectives", topics = c(5, 9), n = 30)
+```
+
+Finally, setting `type` to `"hist"`, we get histograms of topic loadings (per-document-per-topic probabilities $\gamma$) across documents ("MAP" stands for ["maximum a posteriori"](https://en.wikipedia.org/wiki/Maximum_a_posteriori_estimation)). As a reminder, a document topic loading tells us how strongly a given document is associated with a given topic. The histogram of these document topic loadings then shows us the proportions of documents with different loadings. The median is shown as a dashed red line.
+```{r, fig.width=12}
+plot(schwurbel_stm, type = "hist", labeltype = "frex")
+```
+
+Again, we can recreate this using ggplot, although it might be *slightly* more work:
+```{r, fig.width=12}
+topic_words <- tidy(schwurbel_stm, matrix = "frex") |>
+  group_by(topic) |>
+  slice_head(n = 5) |>
+  reframe(term = str_c(term, collapse = ", "))
+tidy(schwurbel_stm, matrix = "gamma") |>
+  group_by(topic) |>
+  mutate(median_gamma = median(gamma)) |>
+  left_join(topic_words, by = "topic") |>
+  ggplot(aes(x = gamma)) +
+  geom_histogram(binwidth = .05, boundary = 0) +
+  geom_vline(aes(xintercept = median_gamma), linetype = "dashed", colour = "red") +
+  facet_wrap(vars(topic, term)) +
+  labs(x = expression(gamma))
+```
+
+Of course, we can also recreate the "top topics" plot from above:
+```{r, fig.height=5}
+tidy(schwurbel_stm, matrix = "gamma") |>
+  group_by(topic) |>
+  summarise(mean = mean(gamma)) |>
+  arrange(desc(mean)) |>
+  left_join(topic_words, by = "topic") |>
+  ggplot(aes(x = mean, y = as.character(topic) |> fct_inorder() |> fct_rev())) +
+  geom_col() +
+  xlim(c(0, .18)) +
+  geom_label(aes(label = term), hjust = "left", nudge_x = .002) +
+  labs(title = "Top topics", y = "topic", x = "expected relative frequency")
+```
+
+
+### Correlations between topics
+Since topics can be correlated in a STM, it might be interesting to see which topics often appear together.
+
+Correlation matrix:
+```{r}
+topicCorr(schwurbel_stm)$cor
+```
+
+Visualised:
+```{r, fig.width=8}
+topicCorr(schwurbel_stm) |> plot()
+```
+
+Since this doesn't include correlation size, it's arguably not that informative. But we can easily create our own visualisation:
+```{r, fig.width=4, fig.height=4}
+#| message: false
+#| warning: false
+library(igraph)
+library(tidygraph)
+library(ggraph)
+nw <- graph_from_adjacency_matrix(topicCorr(schwurbel_stm)$poscor, # only positive correlations
+                                  diag = FALSE,
+                                  weighted = TRUE,
+                                  mode = "undirected")
+nw_tbl <- nw |> as_tbl_graph()
+nw_tbl <- nw_tbl |>
+  mutate(topic = 1:n())
+nw_tbl |>
+  ggraph(layout = "igraph", algorithm = "circle") +
+  geom_node_point(size = 2,
+                  colour = "#008855") +
+  geom_node_text(aes(label = topic),
+                 nudge_y = -.08) +
+  geom_edge_arc(aes(alpha = weight,
+                    label = round(weight, 2)),
+                label_alpha = NA,
+                label_dodge = unit(2.5, "mm"),
+                label_size = 3,
+                angle_calc = 'along') +
+  theme_graph() +
+  theme(legend.position = "none")
+```
+
+### Estimating effects
+The `estimateEffect()` function can be used to quickly create regression models in which the dependent variable is the proportion of an individual topic in each document. Independent variables/covariates can be any kind of document-level metadata. In this case, let's see if there are topics whose proportions differ significantly between Geschwurbel and non-Geschwurbel posts. (One thing to keep in mind is that the function incorporates uncertainty from the topic model and some sampling, making it a little more complicated than simple linear regression; this also means that you'll get slightly different results every time you run the code.)
+```{r}
+schwurbel_effect <- estimateEffect(1:16 ~ Geschwurbel, schwurbel_stm, meta = covariates)
+schwurbel_effect |> summary(topics = 1:16)
+```
+
+`tidy()` can be used to get all of this as a tibble:
+```{r}
+tidy(schwurbel_effect)
+```
+
+Apparently, topics 5 ('vaccination'), 7 ('QAnon') and 12 (?) are significantly more likely to contain Geschwurbel, whereas topics 11 ('Epoch Times newsticker') and 13 ('information about COVID-19 protests'?; possibly semantically incoherent) are more likely to not contain Geschwurbel.
+
+You can also `plot()` the results in different ways (`?plot.estimateEffect`):
+```{r, fig.width=10, fig.height=10}
+par(mar = c(5.1, 9.1, 4.1, 2.1))
+schwurbel_effect |>
+  plot("Geschwurbel", method = "difference", cov.value1 = "ja", cov.value2 = "nein")
+par(mar = c(5.1, 4.1, 4.1, 2.1)) # default values
+```
+
+
+### Trying and comparing different numbers of topics
+Since we usually don't (and can't) know the ideal number of topics in our model beforehand, it makes sense to run and explore models with different values of `K`. But how do we then determine which of them is "best"?
+
+Topics can be "bad" in different ways:
+
+- they can appear wholly random
+- they can cluster words together which are not related in a meaningful way (e.g. function words or foreign language material)
+- they can include some terms that do not quite fit the topic's apparent core concept ("intruder" words)
+- they can combine two or more distinct topics in one
+- they can be too specific and thus fail to detect a more general topic
+
+Given enough time, we *could* go through the topics of each model to find out which model seems to make the most sense overall. But if we want to consider many different values of `K`, that's probably unrealistic. Instead, we can use a variety of model diagnostics to evaluate and compare models.
+
+#### Semantic coherence
+[Semantic coherence](https://dl.acm.org/doi/10.5555/2145432.2145462) is intended to measure how well a topic's top `M` words fit together. "The core idea here is that in models which are semantically coherent the words which are most probable under a topic should co-occur within the same document." (`?semanticCoherence`) The closer to zero the value for a topic, the more coherent it is.
+
+```{r}
+tibble(topic = factor(1:16),
+       semantic_coherence = semanticCoherence(schwurbel_stm, docs, M = 10)) |>
+  ggplot(aes(x = topic, y = semantic_coherence)) +
+  geom_col()
+```
+
+#### Exclusivity
+The documentation notes that "semantic coherence alone is relatively easy to achieve by having only a couple of topics which all are dominated by the most common words". To counteract this possible problem, the top words of a topic should not appear within the top words of another topics -- in other words, they should be exclusive to a single topic (cf. [Roberts et al. 2014](https://scholar.harvard.edu/files/dtingley/files/topicmodelsopenendedexperiments.pdf)). For each topic, the `exclusivity()` function returns the sum of the FREX values (between 0 and 1) of its `M` top words. The maximum value is then equal to `M`. Lower values indicate lower exclusivity.
+
+In our case, there's not much to see here:
+```{r}
+tibble(topic = factor(1:16),
+       exclusivity = exclusivity(schwurbel_stm, M = 10, frexw = .7)) |> # frexw: weight for exclusivity (between 0 and 1); weight for frequency is 1 - frexw
+  ggplot(aes(x = topic, y = exclusivity)) +
+  geom_col()
+```
+
+#### Residual dispersion
+[Taddy (2012)](https://proceedings.mlr.press/v22/taddy12/taddy12.pdf) proposed a diagnostic method based on residuals. The documentation for `checkResiduals()` has this to say:
+
+> The basic idea is that when the model is correctly specified the multinomial likelihood implies a dispersion of the residuals: $\sigma^2 = 1$. If we calculate the sample dispersion and the value is greater than one, this implies that the number of topics is set too low, because the latent topics are not able to account for the overdispersion. In practice this can be a very demanding criterion, especially if the documents are long. However, when coupled with other tools it can provide a valuable perspective on model fit.
+
+So, lower values are better, and values greater than one imply that you should try models with more topics. In our case, however, this criterion doesn't appear to be very helpful (see graph in next section).
+
+```{r}
+checkResiduals(schwurbel_stm, docs)
+```
+
+
+#### Going through a range of topic numbers
+The `searchK()` function automatically computes topic models for a given vector of topic numbers (this may take a lot of time, depending on the size of the document-term matrix and the length of the vector). You can then use `plot()` on the resulting object to see comparisons of (averages of) different diagnostics to help you choose the most adequate model. Don't rely too heavily on these, however -- even with very good stats, a model can still be nonsense.
+
+The results also include values for heldout likelihood. The idea here "is to hold out some fraction of the words in a set of documents, train the model and use the document-level latent variables to evaluate the probability of the heldout portion" (the higher, the better; see `?make.heldout`).
+```{r}
+different_k <- searchK(dfm,
+                       K = seq(4, 40, by = 4), # number of topics (4, 8, 12, ..., 40)
+                       N = floor(.1 * nrow(covariates)), # number of documents to be partially held out
+                       data = covariates,
+                       prevalence = ~ channel,
+                       init.type = "Spectral",
+                       verbose = FALSE) # set to TRUE to see status updates
+```
+
+```{r}
+different_k$results |> map(unlist) |> as_tibble()
+```
+
+
+```{r}
+plot(different_k)
+```
+
+## Model outputs as features for supervised classification
+The per-document-per-topic probabilities $\gamma$ can be used as features for classification models. You simply need them in a feature matrix with one document per row and one topic per column:
+```{r}
+feats <- tidy(schwurbel_stm, matrix = "gamma", document_names = covariates$id) |>
+  pivot_wider(names_from = "topic", values_from = "gamma", names_prefix = "topic_")
+
+feats <- covariates |> left_join(feats, by = c("id" = "document"))
+
+feats
+```
+Here's a quick demonstration using logistic regression. Of course, in practice, you should train the model on the training set and evaluate on the test set.
+```{r}
+feats |>
+  select(Geschwurbel:last_col()) |>
+  glm(Geschwurbel ~ ., data = _,
+      family = "binomial") |>
+  summary()
+```
+
+
+## Further resources
+- [Basic introduction to topic modelling by Silge/Robinson](https://www.tidytextmining.com/topicmodeling)
+- [Deeper explanation of LDA (with R code) by Tufts](https://miningthedetails.com/LDA_Inference_Book/index.html)
+- [Chapter on topic modelling by Puschmann/Haim](https://content-analysis-with-r.com/6-topic_models.html)
+- [Tutorial on topic modelling by Hase](https://bookdown.org/valerie_hase/TextasData_HS2021/tutorial-13-topic-modeling.html)

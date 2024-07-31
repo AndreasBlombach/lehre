@@ -1,0 +1,452 @@
+---
+title: "Logistic Regression"
+author: "Andreas Blombach, Philipp Heinrich"
+date: last-modified
+date-format: long
+format:
+  html:
+    self-contained: true
+    toc: true
+    toc-depth: 3
+    code-fold: false
+    code-tools: true
+    theme: yeti
+    df-print: paged
+    fig-width: 8
+    fig-height: 5
+    link-external-icon: true
+---
+
+```{r, message=FALSE}
+library(tidyverse)
+library(broom)
+library(skimr)
+library(scales) # percent
+library(moderndive) # geom_parallel_slopes
+library(car)
+library(ggcorrplot)
+library(rms)
+library(caret)
+library(yardstick)
+```
+
+## A simple classification problem
+
+Can Germans correctly pronounce 'squirrel' if their shoes are on fire? Let's have a look at some (entirely made-up) experimental data to find out!
+
+We'll include two predictor variables:
+
+-   language proficiency (0-5, see <https://en.wikipedia.org/wiki/ILR_scale>)
+-   shoes on fire (yes, no)
+
+```{r}
+data <- tibble(
+  Pronunciation = factor(c(0, 0, 0, 0,
+                           0, 0, 0, 1, 0, 0, 1,
+                           1, 0, 0, 0, 1, 0, 0, 1, 0,
+                           0, 1, 1, 0, 1, 0, 0, 0, 1, 1, 0, 1, 0, 1, 1,
+                           1, 1, 0, 1, 0, 1, 1, 1, 0, 1, 1,
+                           1, 1, 1, 1,
+                           0, 0, 0,
+                           0, 0, 0, 0, 0, 0, 0, 0, 0,
+                           0, 1, 0, 0, 0, 0, 0, 0, 0,
+                           1, 0, 0, 1, 0, 1, 0, 0, 0, 0, 0,
+                           1, 1, 0, 0, 1, 0, 1, 1, 0, 0, 0, 1, 0,
+                           1, 0, 1, 1, 1),
+                         labels = c("Wrong", "Correct")),
+  Proficiency = c(rep(0, 4), rep(1, 7), rep(2, 9), rep(3, 15), rep(4, 11), rep(5, 4),
+                  rep(0, 3), rep(1, 9), rep(2, 9), rep(3, 11), rep(4, 13), rep(5, 5)),
+  Shoes_on_fire = factor(c(rep(0, 50), rep(1, 50)), labels = c("No", "Yes"))
+)
+skim(data)
+```
+
+Let's start by visually inspecting the relationship between `Pronunciation` and the two independent variables:
+
+```{r}
+# new labels for facets:
+shoe_labs = as_labeller(c(No = "Shoes not on fire", Yes = "Shoes on fire"))
+
+
+data |> ggplot(aes(x = Pronunciation, fill = factor(Proficiency))) +
+  geom_bar(position = "dodge") +
+  facet_wrap(~ Shoes_on_fire, labeller = shoe_labs) +
+  scale_fill_viridis_d() +
+  labs(fill = "Proficiency")
+```
+
+We can also create a scatter plot, but since our dependent variable is categorical, we wouldn't be able to see much without adding some random noise to each observation's position.
+
+```{r}
+data |> ggplot(aes(x = Proficiency, y = Pronunciation, colour = Shoes_on_fire)) +
+  geom_jitter(width = .1, height = .2, alpha = .8)
+```
+
+Another possibility is to count the number of observations at a given point in the coordinate system and to map it to point area.
+
+```{r}
+data |> ggplot(aes(x = Proficiency, y = Pronunciation, group = Shoes_on_fire, colour = Shoes_on_fire)) +
+  geom_count(position = position_dodge(width = .2))
+```
+
+## Linear regression
+
+If we try linear regression with a categorical outcome, R will throw disgusted warning messages at us and refuse to speak to us for the next hour or so. We also won't be able to do much with the output. So let's not do that.
+
+As linear regression requires a numeric outcome, we could, however, just convert the levels of the categorical dependent variable to numbers. In our case, these numbers would be 1 for the correct pronunciation and 0 for the wrong pronunciation.
+
+```{r}
+linmod <- lm(as.integer(Pronunciation) - 1 ~ Shoes_on_fire + Proficiency,
+             data = data) # correct: 1, wrong: 0
+summary(linmod)
+```
+
+We can actually visualise our predictions using the plot above as a base. Since we have not included an interaction between `Shoes_on_fire` and `Proficiency`, the slopes are parallel to each other:
+
+```{r}
+data |> mutate(Pronunciation = as.integer(Pronunciation) - 1) |>
+  ggplot(aes(x = Proficiency, y = Pronunciation, group = Shoes_on_fire, colour = Shoes_on_fire)) +
+  geom_count(position = position_dodge(width = .5)) +
+  geom_parallel_slopes(se = FALSE) + # moderndive
+  labs(y = "Probability of correct pronunciation")
+```
+
+At first glance, the model doesn't look too bad. Both predictors appear to be significant, and the values make some sense: If a participant's shoes are on fire, the predicted outcome will be lower by .23, so a wrong pronunciation is more likely in this case. And a higher language proficiency increases the predicted outcome (.17 for each proficiency point).
+
+The whole model has an adjusted R² value of .28 which, while not spectacular, is not too bad.
+
+However, some predicted probabilities don't make much sense at all -- they are negative!
+
+```{r}
+augment(linmod) |> arrange(.fitted)
+```
+
+Likewise, it is also possible to predict probabilities greater than 1 using a linear model. Since we don't want that, let's turn to our lord and saviour, logistic regression.
+
+## Logistic Regression
+
+Logistic regression is an extension of linear regression and a special case of the so-called generalised linear model (GLM/GLiM).
+
+In linear regression, the relationship between dependent variable and a number of independent variables could be modelled as follows:
+
+$$ y_i = \beta_0 + \beta_1 x_{1i} + \beta_2 x_{2i} + \ldots + \beta_n x_{ni} + \varepsilon_i $$
+
+In logistic regression, the values of the dependent variable are no longer predicted directly. Instead, we predict the probability of one level given the values of the independent variables. (This probability is also called *probability of success*.)
+
+Again, this level is internally represented as 1; for a factor in R, the second level is chosen -- so if you want to change that, you have to change the order of the levels.
+
+The formula thus becomes:
+
+$$ P(y_i = 1) = \frac{1}{1 + e^{-(\beta_0 + \beta_1 x_{1i} + \beta_2 x_{2i} + \ldots + \beta_n x_{ni})}} $$ The formula may be easier to understand if we split it up. One part is the linear predictor which we might (should!) remember from (multiple) linear regression:
+
+$$ t = \beta_0 + \beta_1 x_{1i} + \beta_2 x_{2i} + \ldots + \beta_n x_{ni} $$ The other part is the logistic function (a sigmoid function) that converts any real number (the input) into a value between 0 and 1 (output). This function thus takes on the role of the *link function* -- a link function (often non-linear) is an integral part of every generalised linear model.
+
+It looks like this:
+
+$$ f(t) = \frac{1}{1 + e^{-t}} = \frac{e^{t}}{1 + e^{t}} $$
+
+In R (try different input values!):
+
+```{r}
+logistic <- function(x) {
+  output <- 1 / (1 + exp(-x))
+  return(output)
+}
+x <- seq(-10, 10, .1)
+plot(x, logistic(x), type = "l",
+     col = "blue",
+     main = "Logistic function",
+     ylab = "Output",
+     xlab = "Input")
+```
+
+Looking closely at the curve, you may realise that an equally large change in the input can lead to different changes in the output, depending on the initial value of the input.
+
+For example, if $x$ is 0 and then increases by 0.4, y increases from 0.5 to \~0.6 (if interpreted as probabilities, i.e. from 50% to \~60%). If, on the other hand, x is first 3.2, then also increases by 0.4, y increases from \~0.96 to only \~0.97.
+
+This will become very important when interpreting the coefficients of a logistic regression model. (It will also be frustrating. Sorry!)
+
+Instead of `logistic()` we can also use `plogis()`. The logistic function is often called $logit^{-1}(t)$, because it is the inverse function of the logit function, which maps the values from 0 to 1 (usually probabilities) to -∞ to +∞ (R function: `qlogis()`):
+
+$$ logit(p) = ln(\frac{p}{1 - p}) $$ $$ \frac{p}{1 - p} $$ are the *odds*, a measure of the likelihood of a particular outcome given by the probability of an event divided by the probability of its complement (the probability of the event not occurring). Consequently, the logit function is the (natural) logarithm of the odds (and therefore also called *log-odds*).
+
+(A logit value of 0 corresponds to a probability of 0.5; furthermore, positive logit values correspond to probabilities \> 0.5 and negative values to probabilities \< 0.5).
+
+So, we can also write the formula for logistic regression as:
+
+$$ P(y_i = 1) = p_i = logit^{-1}(t) $$ $$ logit(p_i) = \beta_0 + \beta_1 x_{1i} + \beta_2 x_{2i} + \ldots + \beta_n x_{ni} $$ This relationship is linear. But in contrast to linear regression, we cannot use the method of least squares to calculate parameter values. Instead, they must be estimated via *maximum likelihood*. A maximum likelihood estimation (*MLE*) selects those parameter values that make the occurrence of the observed values appear most likely (by maximising the *likelihood function*).
+
+To create a logistic regression model in R, we use `glm()`. Since this function is used for different generalised linear models, we also need to specify `family = binomial`.
+
+```{r}
+logmod <- glm(Pronunciation ~ Proficiency + Shoes_on_fire,
+              family = binomial, data = data)
+logmod
+```
+
+Let's compare curves:
+
+```{r}
+# includes interaction(!)
+data |> mutate(Pronunciation = as.integer(Pronunciation) - 1) |>
+  ggplot(aes(x = Proficiency, y = Pronunciation, group = Shoes_on_fire, colour = Shoes_on_fire)) +
+  geom_count(position = position_dodge(width = .5)) +
+  geom_smooth(method = glm, se = FALSE, method.args = list(family = binomial)) +
+  geom_smooth(method = lm, se = FALSE) +
+  labs(y = "Probability of correct pronunciation")
+```
+
+Without interaction (actual model predictions):
+
+```{r}
+plin <- augment(linmod)
+plog <- augment(logmod, type.predict = "response")
+
+data |> mutate(Pronunciation = as.integer(Pronunciation) - 1) |>
+  ggplot(aes(x = Proficiency, y = Pronunciation, group = Shoes_on_fire, colour = Shoes_on_fire)) +
+  geom_count(position = position_dodge(width = .5)) +
+  geom_line(aes(y = .fitted), data = plin) +
+  geom_line(aes(y = .fitted), data = plog) +
+  labs(y = "Probability of correct pronunciation")
+```
+
+We can see that our logistic regression model doesn't predict negative probabilities. Yay! But how good is the model?
+
+Let's go through the output.
+
+```{r}
+summary(logmod)
+```
+
+Sadly, interpreting the coefficients isn't as straightforward as with linear regression.
+
+The coefficient of `Proficiency` tells us the following: If `Proficiency` is increased by 1 (holding other variables, i.e. `Shoes_on_fire`, constant), the logit (the logarithm of the odds, log-odds) increases by \~1.03.
+
+What?
+
+```{r}
+tidy(logmod)
+```
+
+Looking at the signs of the estimates, we see that higher values of `Proficiency` increase the logit and thus the probability of the correct pronunciation. Likewise, burning shoes (`Yes`) decrease it (compared to the reference level, `No`).
+
+As mentioned above, using the logit results in a linear relationship, although we can't really interpret it:
+
+```{r}
+plog <- plog |> mutate(logit = log(.fitted / (1 - .fitted))) # or: augment(logmod, type.predict = "link")
+plog |>
+  ggplot(aes(x = Proficiency, y = logit, colour = Shoes_on_fire)) +
+  geom_count() +
+  geom_line() +
+  labs(y = "Predicted logit (log-odds) of pronunciation")
+```
+
+The inverse function of the natural logarithm is the exponential function $e^x$. It is often applied to the coefficients (in R: `exp()`). The transformed coefficients are to be interpreted differently: If the variable in question is increased by one unit, the odds are multiplied by the transformed value. So, if you prefer to think in terms of odds instead of log-odds, this may at least be *slightly* more intuitive.
+
+```{r}
+exp(coef(logmod))
+exp(confint(logmod)) # confidence intervals
+```
+
+Annoyingly, the coefficients cannot be related directly to the probabilities because the relationship between the probability of success and the linear predictor is not linear (as can be seen above, looking at the curve of the logistic function). A one-unit increase in an independent variable can therefore lead to different changes in the probability of success, depending on its initial value.
+
+```{r}
+glance(logmod)
+```
+
+We still need some statistics to assess goodness of fit. In the output, we already see the *deviance*:
+
+$$ Deviance = -2 \cdot LL $$
+
+*LL* stands for log-likelihood. In principle, this is analogous to the residual sum of squares: It shows us how much unexplained information remains after fitting the model.
+
+The log-likelihood is computed using the observed (O) values and those predicted by the model (P = probability of success).
+
+$$ LL = \sum \limits_{i=1}^{N} (O_i \ln(P_i) + (1 - O_i) \ln(1 - P_i)) $$
+
+```{r}
+observed <- data$Pronunciation |> as.integer() - 1
+predicted <- predict(logmod, type = "response")
+LL <- sum(observed * log(predicted) + (1 - observed) * log(1 - predicted))
+LL
+```
+
+To get the deviance, we multiply this value by -2, so it is $\chi^2$-distributed -- we can then compute a *p*-value. The smaller the deviance, the better.
+
+```{r}
+-2 * LL
+```
+
+For a statistical test of the whole model, one can calculate the deviance difference between the base or null model (model with $\beta_0$ only) and the full model; the degrees of freedom also result from the difference of the respective degrees of freedom (and each model has as many degrees of freedom as observations minus parameters).
+
+```{r}
+x2 <- logmod$null.deviance - logmod$deviance
+df <- logmod$df.null - logmod$df.residual
+pchisq(x2, df, lower.tail = FALSE)
+```
+
+This is a likelihood-ratio test showing us that the model as a whole is significant.
+
+We're still missing something like $R^2$, telling us how well the model fits the data.
+
+Because we're not the only ones missing this, many *pseudo*-$R^2$ variants have been developed for logistic regression. Unfortunately, which of these is most suitable is disputed.
+
+Hosmer and Lemeshow (1989) proposed to divide the likelihood ratio, i.e. the deviance difference we have just calculated, by the deviance of the null model:
+
+```{r}
+x2 / logmod$null.deviance
+```
+
+The function `lrm()` from the `rms` package gives us Nagelkerke's R²:
+
+```{r}
+lrm(Pronunciation ~ Proficiency + Shoes_on_fire,
+    data = data)
+```
+
+## A more complicated classification problem
+
+Remember our SMS data set? Let's see if we can use logistic regression to predict if a message is ham or spam.
+
+Cleaning up the texts might help a bit:
+
+```{r, message=FALSE}
+# smsspam <- read_tsv(
+#   "data/smsspam.tsv",
+#   quote = "",
+#   col_names = c("y", "text")
+# )
+# 
+# weird <- substr(smsspam$text[19], 13, 13)
+# smsspam$text <- str_replace_all(smsspam$text, weird, "'")
+# smsspam$text <- str_replace_all(smsspam$text, "\u0094", '"')
+# smsspam$text <- str_replace_all(smsspam$text, "\u0091", "'")
+# smsspam$text <- str_replace_all(smsspam$text, "\u0096", "\u2013")
+# smsspam$text <- str_replace_all(smsspam$text, "\u0093", "")
+# smsspam$text <- str_replace_all(smsspam$text, "&lt;", "<")
+# smsspam$text <- str_replace_all(smsspam$text, "&gt;", ">")
+# smsspam$text <- str_replace_all(smsspam$text, "&amp;", "&")
+# 
+# smsspam$text <- str_replace_all(smsspam$text, r"([[:digit:]]{5,}|\b[0-9]{3,}([[:space:],–-]?[0-9]{2,})+\b)", "<#>")
+# 
+# write.table(smsspam, "../data/smsspam_clean.tsv", quote = FALSE,
+#             sep = "\t", fileEncoding = "UTF-8", row.names = FALSE)
+
+smsspam <- read_tsv(
+  "data/smsspam_clean.tsv",
+  quote = ""
+)
+
+smsspam <- distinct(smsspam)
+```
+
+Let's craft some features. Keep in mind that `spam_words` and `ham_words` include manually selected words -- that's *not* the way to go, we're just doing this to demonstrate the distinctive power of relevant words.
+
+```{r}
+smsspam$y |> table() |> prop.table() # majority classifier: "ham" (87,8%)
+
+re_spam <- regex(r"(\b(urgent|txt|cash|mobile|claim|chance|w[io]n|prize|msg|nokia|horny|admirer|xxx)\b|free|http|www|\.(com|net|co\.uk|org)|[$£]|\bsex|[0-9]{3,})",
+                 ignore_case = TRUE)
+
+re_ham <- regex(r"(\b(love|miss|hope|home|haha|lol|yeah|than(ks|x)|thx|sleep|sorry|gonna|much|well|morning|come|like|my|u|ü|ur|class|wan|(be)?co[sz]|i'm|hi|wait)\b|'ll)",
+                ignore_case = TRUE)
+
+spam <- smsspam |>
+  mutate(y = factor(y),
+         length = str_length(text),
+         punct = str_count(text, "[[:punct:]]") / length,
+         numbers = str_detect(text, "<#>"),
+         spam_words = str_count(text, re_spam),
+         ham_words = str_count(text, re_ham))
+
+spam |>
+  group_by(y) |>
+  summarise(mean_length = mean(length),
+            sd_length = sd(length),
+            mean_punct = mean(punct),
+            sd_punct = sd(punct),
+            pct_numbers = sum(numbers) / n(),
+            mean_spam_words = mean(spam_words),
+            sd_spam_words = sd(spam_words),
+            mean_ham_words = mean(ham_words),
+            sd_ham_words = sd(ham_words))
+```
+
+How well do `length`, `numbers` and `punct` work together?
+
+```{r}
+spammod <- glm(y ~ length + numbers + punct,
+               family = binomial,
+               data = spam)
+summary(spammod)
+```
+
+Let's now include our crude hand-crafted features `ham_words` and `spam_words` as additional predictors:
+
+```{r}
+spammod <- glm(y ~ length + numbers + spam_words + ham_words + punct,
+               family = binomial,
+               data = spam)
+summary(spammod)
+```
+
+This doesn't look too bad. We can also have a look at the predicted labels and compare them to the real ones:
+
+```{r}
+spam_prob <- predict(spammod, type = "response")
+cats.pred <- factor(ifelse(spam_prob > .5, "spam", "ham"))
+sum(cats.pred == spam$y) / nrow(spam) # accuracy
+```
+
+If we don't just want to know how many labels were predicted correctly all in all, we can also look at the *confusion matrix* to see how many times *each label* was predicted correctly and how many times it was wrongly predicted as another label. The matrix thus shows the model's confusion (not your own, although you may also be confused at first) -- instances in which one label is confused for another.
+
+The rows of the confusion matrix are the predicted labels, the columns are the true labels:
+
+```{r}
+table(cats.pred, spam$y)
+```
+
+We can also use `confusionMatrix()` from the `caret` package to get the confusion matrix and additional statistics:
+
+```{r}
+confusionMatrix(cats.pred, spam$y)
+```
+
+[This Wikipedia page](https://en.wikipedia.org/wiki/Evaluation_of_binary_classifiers) is a very useful reference. :)
+
+[`yardstick`'s function reference](https://yardstick.tidymodels.org/reference/index.html) may also be helpful.
+
+Using the `yardstick` package from the newer `tidymodels` framework instead:
+```{r}
+cm <- tibble(truth = spam$y, pred = cats.pred) |>
+  conf_mat(truth, pred)
+cm
+```
+Same summary statistics, just as a tibble:
+```{r}
+cm |> summary()
+```
+
+
+These observations have been falsely classified:
+
+```{r}
+spam |> filter(cats.pred != spam$y) |> arrange(y)
+```
+
+### Multicollinearity
+
+While there is a strong correlation between `spam_words` and `numbers`, it's not so high as to be problematic.
+
+```{r}
+spam |> select(length, numbers, spam_words, ham_words, punct) |>
+  cor() |> ggcorrplot(lab = TRUE) +
+  ggtitle("Pearson correlations")
+```
+
+Indeed, all variance inflation factors are close to 1; so is their mean.
+
+```{r}
+vif(spammod)
+mean(vif(spammod))
+```

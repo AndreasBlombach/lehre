@@ -1,0 +1,588 @@
+---
+title: "Working with data sets"
+author: "Andreas Blombach"
+date: last-modified
+date-format: long
+format:
+  html:
+    self-contained: true
+    toc: true
+    toc-depth: 3
+    code-fold: false
+    code-tools: true
+    theme: yeti
+    df-print: paged
+    fig-width: 8
+    fig-height: 5
+    link-external-icon: true
+---
+
+```{r}
+#| message=FALSE, warning=FALSE
+library(tidyverse)
+library(readxl)
+library(data.table)
+library(corpora)
+library(psych)
+library(skimr)
+```
+
+
+## Data sets
+We can import data in a number of ways. R generally prefers CSV
+files, but there are packages to read in other file formats
+(Excel, SPSS, JSON, etc.).
+
+We cannot go into all of the details -- but here is a whole
+course on the topic if you want to learn more:
+https://learn.datacamp.com/courses/importing-data-in-r-part-1
+
+
+### Reading in data
+Those with some R experience probably already know
+`read.table()`, `read.csv()`, `read.csv2()` etc. (Note that, as
+of R version 4.0, the parameter `stringsAsFactors` is set to
+FALSE by default.)
+
+Alternatively, you can read in a data set as a tibble which is
+a little faster. For *really* large files, the `data.table`
+package offers the function `fread()`.
+
+Which function is best suited to read in a specific file
+depends on the file format and the file's formatting (field
+separator, decimal point, etc.). (Exception: `fread()`.
+`fread()` doesn't care and usually figures this out by itself.)
+
+For CSV files in European format (semicolon as field separator,
+comma as decimal point), use `read_csv2()`:
+```{r}
+gen_blogs <- read_csv2("data/Genitive_DWDS_Blogs.csv")
+```
+
+We can now have a look at the data:
+```{r}
+gen_blogs
+```
+
+You can also use `str()` to display its internal structure (or
+the structure of any R object, really) or `glimpse()` to get an
+overview over all the columns:
+```{r}
+str(gen_blogs)
+glimpse(gen_blogs)
+```
+
+
+When you read in data, you can also specify data types for
+certain columns:
+```{r}
+gen_blogs <- read_csv2("data/Genitive_DWDS_Blogs.csv",
+                       col_types = "?ii")
+gen_blogs
+```
+
+The first argument is a file path. Since the folder "data" is
+located in my current working directory, I don't need to
+specify the full/absolute path.
+
+Alternatively, you can use `file.choose()` to select a file:  
+`read_csv2(file.choose())`
+
+Try it out!
+
+There's also `read_csv()` for classic CSV files (comma as field
+separator, `.` as decimal point), `read_tsv()` for files with
+tab stops as field separators, and `read_delim()`, the parent
+function where you can specify everything yourself.
+
+RStudio offers some options to read in files a little more
+comfortably: File -> Import Dataset
+
+- From Text (base)...: base R functions: `read.table()` etc.:
+  data.frame
+- From Text (readr)...: tidyverse/readr style: tibble
+- From Excel...: Excel files (tibble)
+- From SPSS...: SPSS files (tibble)
+- From SAS...: SAS files (tibble)
+- From Stata...: Stata files (tibble)
+
+Having selected fitting options to import your data and having
+clicked "Import", you can see the R command on the console.
+You can then copy it to your script to speed up the process in
+the future.
+
+Example: Opening an Excel file:
+```{r}
+gen_blogs <- read_excel("data/Genitive_DWDS_Blogs.xlsx")
+gen_blogs
+```
+
+
+So far, we've imported all data as tibbles. When you look at
+these, you can see each column's data type directly (otherwise,
+use a function such as `str()` to display the structure of an
+object such as a data.frame).
+
+The most common data type abbreviations are:
+
+- chr for character
+- fct for factor
+- int for integer
+- dbl for double
+- lgl for logical
+
+For a full list, see:
+https://tibble.tidyverse.org/articles/types.html.
+
+
+If you've got your own data with you, now's the time to try to
+open it!
+
+Otherwise, there are a few variations of the same data
+available:
+
+- romane.tsv
+- romane.csv
+- romane2.csv
+- romane3.csv
+- romane4.csv
+
+Can you read in all of them correctly?
+```{r}
+romane <- read_tsv("data/romane.tsv",
+                   col_types = cols(Genre = "f", Kategorie = "f"))
+romane
+```
+
+
+### Accessing parts of a data set
+To access a column (usually a statistical variable), enter the
+data set's name, followed by a dollar sign and the name of the
+column. We get a vector of values (let's not display all of
+them by using `head()`):
+```{r}
+gen_blogs$Lemma |> head()
+gen_blogs$s.Genitiv |> head()
+```
+
+The weird little operator `|>` here is called a pipe operator.
+It was introduced in R 4.1.0 after a similar operator (from the
+`magrittr` package), `%>%`, had already been commonly used in the
+Tidyverse for quite some time and had gained a lot of traction
+in the R community.
+
+Both of these operators simply take the object to their left as
+the (first) input of the function to their right.
+
+This generally makes code more readable – instead of using
+functions inside of functions inside of functions, just *pipe*
+the output to the next function etc.
+
+The last line of code is therefore equivalent to:
+```{r}
+head(gen_blogs$s.Genitiv)
+```
+
+There are some subtle differences between `|>` and `%>%` (see e.g.
+[here](https://stackoverflow.com/questions/67633022/what-are-the-differences-between-rs-new-native-pipe-and-the-magrittr-pipe)),
+but in most cases, they can be used interchangeably. The native
+pipe (`|>`) is a little faster, however.
+
+Pressing Ctrl+Shift+M (Mac: Cmd+Shift+M) in RStudio inserts a
+pipe operator (you can select your preferred one in the options).
+
+Just as with vectors, you can use square brackets to subset
+a data set. You just have to provide two values: row and
+column.
+```{r}
+romane[2, 3] # second row, third column
+romane[3, c(1, 3)] # third row, columns 1 and 3
+romane[3,] # third row, all columns (don't forget the comma!)
+romane[, 6] # sixth column
+```
+
+
+To select certain columns, `select()` is also useful:
+```{r}
+romane |> select(Genre, Autor, Titel)
+romane |> select(Genre:Type_token_ratio)
+romane |> select(Type_token_ratio:last_col())
+```
+
+You can also rename variables:
+```{r}
+romane |> select(Titel,
+                  TTR = Type_token_ratio,
+                  Avg_length = Average_token_length_syllables)
+```
+
+If you just want to rename a column while keeping all other
+columns, `rename()` might be more practical:
+```{r}
+romane |> rename(TTR = Type_token_ratio)
+```
+
+
+`select()` is also useful to change the order of columns:
+```{r}
+romane |> select(Titel, Autor, everything()) # everything(): helper function
+```
+
+
+### Filtering data sets
+You'll often want to get parts of a data set not according to
+their position, but according to certain conditions which must
+be fulfilled. That's what `filter()` is for (or the base R
+function `subset()`).
+
+gen_blogs has 17512 rows -- let's just use the lemmas which
+appear at least five times in any form (arbitrary choice):
+```{r}
+gen_blogs <- gen_blogs |> filter(s.Genitiv >= 5 | es.Genitiv >= 5)
+gen_blogs
+```
+
+
+If several conditions have to be fulfilled, they can be
+separated by commas:
+```{r}
+gen_blogs |> filter(s.Genitiv >= 100, es.Genitiv >= 100)
+```
+
+Logical AND works the same way:
+```{r}
+gen_blogs |> filter(s.Genitiv >= 100 & es.Genitiv >= 100)
+```
+
+
+There are some lemmas in `gen_blogs` that shouldn't be in there.  
+Let's throw them out by using `%in%`:
+```{r}
+gen_blogs <- gen_blogs |>
+  filter(
+    !(Lemma %in% c("Äußer", "Inner", "Wichtiger", "Schlimmer",
+                   "Besser", "Neu"))
+  )
+```
+
+
+Try to ...
+
+- select all rows in `gen_blogs` where `s.Genitiv` is exactly 100
+- select all rows in `gen_blogs` where `es.Genitiv` is between 100 und 200
+- select all rows in `romane` where the genre is sci-fi, the type-token
+  ratio is greater than 0.35 and Honoré's H is greater than 2900
+- select all rows in `romane` where the lexical density is smaller than 0.35
+  or greater than 0.45
+- select all rows in `romane` where the author's name starts with an "A"
+  (tip: `str_detect()`)
+ 
+
+### Modifying data
+Sometimes, you want to modify certain columns. Luckily, not
+only can you call a column using the dollar sign notation,
+you can also assign new values this way.
+
+Alternatively, you can use `mutate()`, a function that comes
+in especially handy if you want to modify several columns at
+once.
+
+In our `romane` data set, `Rarity` specifies the fraction of
+nouns, adjectives and verbs which can also be found in the
+most common 5000 nouns, adjectives and verbs in a reference
+corpus (in this case, the DECOW16BX). But this means that a
+lower value actually signifies a higher rarity (and thus,
+higher complexity) whereas the other measures in the data set
+work the other way around (higher value -> higher complexity).
+Luckily, this is very easy to fix:
+```{r}
+romane$Rarity <- 1 - romane$Rarity
+```
+
+
+More cleanup of `gen_blogs`, using string functions and
+regular expressions:
+
+Words ending in *-nis* have been improperly lemmatised (*-niss*):
+```{r}
+str_subset(gen_blogs$Lemma, "niss$")
+gen_blogs$Lemma <- str_replace(gen_blogs$Lemma, "niss$", "nis")
+```
+
+There are also very few lemmas with non-alphanumerical
+characters at the end:
+```{r}
+gen_blogs$Lemma <- str_replace(gen_blogs$Lemma, "[^[:alpha:]]$", "")
+```
+
+
+### Adding columns
+If you want to add a column to an existing data.frame, tibble
+or data.table, the vector needs to have the same length as the
+other columns.
+
+There are quite a few ways to do this. The easiest one is 
+probably this:
+```{r}
+gen_blogs$Length <- str_length(gen_blogs$Lemma) # word length in characters
+gen_blogs
+```
+
+Optional step: new column with the number of syllables
+```{r}
+#| message=FALSE, warning=FALSE
+
+# install.packages("sylly")
+# install.packages("sylly.de", repo="https://undocumeantit.github.io/repos/l10n")
+library(sylly.de)
+gen_blogs$Syllables <- hyphen_c(gen_blogs$Lemma, hyph.pattern = "de",
+                                quiet = TRUE)
+```
+
+
+`mutate()` can be used to add several columns at once, to change
+existing columns, and to do calculations with columns:
+```{r}
+gen_blogs <- gen_blogs |>
+  mutate(Total = s.Genitiv + es.Genitiv,
+         Frac_es = round(es.Genitiv / Total, 2))
+gen_blogs
+```
+
+
+### Sorting
+Use `arrange()` to change the order of rows:
+```{r}
+gen_blogs |> arrange(desc(es.Genitiv))
+```
+`desc()` to sort in descending order
+
+You can also sort by several columns:
+```{r}
+gen_blogs |> arrange(Length, Lemma)
+gen_blogs |>
+  arrange(desc(Length), desc(s.Genitiv), desc(es.Genitiv))
+
+romane |> arrange(Kategorie, Genre, Autor, Titel)
+```
+
+
+### "Long" and "wide" format
+There are two different presentations for tabular data:
+
+- In "wide" format, each row represents one unit of
+  observation (e.g. a person, a country, a text or a word).
+  There is no redundancy, making it easy to read. In case of
+  repeated measures (e.g. the same statistical variable at
+  different points in time or under different conditions),
+  there are multiple columns.
+- In "long" (or "narrow") format, there are multiple rows for
+  a single unit of observation, one for each condition or
+  point in time. All measurements of the same statistical
+  variable will be in a single column, while another column
+  specifies the category (time, condition, ...).
+
+Many functions in R require the input data to be in a specific
+format (mostly "long"), so you should know how to switch
+between the two.
+
+As a first example, we'll use frequency data of selected nouns
+in the written and spoken parts of the British National Corpus
+(BNC; see `?BNCcomparison`):
+```{r}
+BNCcomparison |> as_tibble()
+```
+
+Since both `written` and `spoken` contain frequencies, we
+could put these in a single column (`frequency`), with another
+column denoting the modality. To transform from "wide" to
+"long" format, we can use the `pivot_longer()` function:
+```{r}
+BNC_long <- BNCcomparison |>
+  pivot_longer(cols = written:spoken,
+               names_to = "modality",
+               values_to = "frequency")
+BNC_long
+```
+
+To transform back to "wide" format, use `pivot_wider()`:
+```{r}
+BNC_long |>
+  pivot_wider(names_from = "modality",
+              values_from = "frequency")
+
+```
+
+Can you do the same thing with `gen_blogs`?
+
+
+There are lots of examples in the vignette -- have a look!  
+`vignette("pivot")`
+
+
+The following more complex code shows an example using the
+`romane` data. We want to know which genres are more or less
+complex according to different measures of lexical complexity.
+Ideally, we'd have a single plot containing all measures by
+genre. We could use boxplots – but before we can do that, we
+have two problems to solve:
+
+- Different measures are on very different scales, making
+  visual comparison almost impossible when using the same
+  y-axis.
+- The plotting function we want to use requires the values of
+  all measures to be in a single column ("long" format).
+  
+Let's do some piping!
+  
+First, we write a little helper function to compute z-scores
+(we could also skip this step and use the in-built function
+`scale()` instead):
+```{r}
+zscores <- function(x) {
+  (x - mean(x)) / sd(x)
+}
+```
+
+Then, we use this function to mutate our data, before transforming
+it to long format (and making a factor out of the new `Measure`
+column):
+```{r}
+romane_long <- romane |>
+  mutate(Type_token_ratio = zscores(Type_token_ratio),
+         Honore_H = zscores(Honore_H),
+         MTLD = zscores(MTLD),
+         Dispersion = zscores(Dispersion),
+         Disparity = zscores(Disparity),
+         Evenness = zscores(Evenness),
+         Density = zscores(Density),
+         Rarity = zscores(Rarity),
+         Average_token_length_syllables = zscores(Average_token_length_syllables)) |>
+  pivot_longer(cols = Type_token_ratio:Honore_H,
+               values_to = "Value", names_to = "Measure") |>
+  mutate(
+    Measure = factor(
+      Measure,
+      levels = c("Average_token_length_syllables",
+                 "Type_token_ratio",
+                 "Honore_H",
+                 "MTLD",
+                 "Disparity",
+                 "Dispersion",
+                 "Evenness",
+                 "Density",
+                 "Rarity"),
+      labels = c("Mean token length in syllables",
+                 "Type-token ratio",
+                 "Honoré's H",
+                 "McCarthy and Jarvis' MTLD",
+                 "Semantic Disparity",
+                 "Dispersion",
+                 "Evenness",
+                 "Lexical density",
+                 "Rarity")
+    )
+  )
+
+romane_long
+```
+
+Finally, we can plot it:
+```{r}
+romane_long |>
+  ggplot(aes(x = Measure, y = Value, colour = Genre)) +
+  geom_boxplot(outlier.alpha = .5) +
+  theme(axis.text.x = element_text(angle = -45, hjust = 0)) +
+  labs(y = "z-score", title = "Standardised measures by genre")
+```
+
+
+
+### Summarising data
+- `group_by()` creates a grouped tibble
+- `summarise` is then used for arbitrary operations (sums,
+means, standard deviations, ...) which are performed by group
+
+Typical descriptive statistics you may want to use:
+
+- `n()`: current group size
+- `mean()`: arithmetic mean
+- `mean(trim = .1)`: trimmed mean (fraction of `trim` removed
+  from both the lowest and the highest values)
+- `median()`: median
+- `var()`: (sample) variance (with Bessel's correction)
+- `sd()`: (sample) standard deviation (with Bessel's correction)
+- `min()`, `max()`: lowest and highest value in a vector
+- `quantile()`: sample quantiles (quartiles by default)
+- `IQR()`: interquartile range (the difference between upper
+  and lower quartile)
+- Different packages offer functions for skew and kurtosis
+  (though most of them actually mean *excess*, not kurtosis),
+  e.g. `psych::skew()` and `psych::kurtosi()`.
+```{r}
+gen_blogs |> group_by(Length) |> 
+  summarise(Lemma_count = n(), s_genitives = sum(s.Genitiv), 
+            es_genitives = sum(es.Genitiv))
+
+gen_blogs |> group_by(Syllables) |> 
+  summarise(Lemma_count = n(), s_genitives = sum(s.Genitiv), 
+            es_genitives = sum(es.Genitiv))
+```
+
+
+Let's see some summary statistics for one of the variables in
+`romane`:
+```{r}
+romane |> group_by(Genre) |>
+  summarise(n = n(),
+            TTR_mean = mean(Type_token_ratio),
+            TTR_median = median(Type_token_ratio),
+            TTR_sd = sd(Type_token_ratio),
+            TTR_IQR = IQR(Type_token_ratio),
+            TTR_min = min(Type_token_ratio),
+            TTR_max = max(Type_token_ratio),
+            TTR_skew = skew(Type_token_ratio),
+            TTR_excess = kurtosi(Type_token_ratio))
+```
+
+
+Lots of packages offer convenient summary functions. Here are
+just a few examples:
+```{r}
+summary(romane) # base R function
+psych::describe(romane) # psych; there's also describeBy() for groups
+skim(romane) # skimr; works with group_by() and can be customised
+romane |>
+  group_by(Genre) |>
+  skim()
+```
+
+
+Does the lemma end in s, ß, z or x?
+```{r}
+gen_blogs$Ends_in_s <- factor(ifelse(str_sub(gen_blogs$Lemma, start = -1) %in% c("s", "ß", "z", "x"), "yes", "no"))
+gen_blogs
+gen_blogs |> group_by(Ends_in_s) |>
+  summarise(s = sum(s.Genitiv), es = sum(es.Genitiv))
+```
+
+
+### Handling missing data
+Missing data should always be `NA` in R. Pay special attention
+to characters vectors -- empty strings should probably often
+be `NA` as well.
+
+Many functions will throw errors when they encounter missing
+values. Luckily, many of them (e.g. `mean()`, `sd()`) also
+have the optional argument `na.rm` that you can set to `TRUE`,
+so they'll ignore any missing data.
+
+The function `na.omit()` will drop missing values from a
+vector; it will drop *all* rows containing missing values from
+a matrix or data.frame. So think carefully before using it on
+whole data sets -- you might throw away useful data. (The same
+goes for the Tidyverse function `drop_na()`.)
+
+The package `tidyr` (from the Tidyverse) also provides further
+useful functions like `replace_na()` (say you want values of 0
+instead of `NA` for specific columns) or `fill()`.
