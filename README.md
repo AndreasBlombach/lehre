@@ -12,3 +12,4 @@ Eine Auswahl eigener Materialien zu meinen Lehrschwerpunkten: Statistik, Korpusl
 	- [Stilometrie 2: Textvergleiche](DH_stilometrie2_de.ipynb) ([HTML-Output](DH_stilometrie2_de.html))
 	- [Stilometrie 3: Klassifikation/Autorschaftszuschreibung](DH_stilometrie3_de.ipynb) ([HTML-Output](DH_stilometrie3_de.html))
 - [Structural Topic Models (STMs) in R](topic_models_en.qmd), inklusive Tokenisierung und Tagging der Texte in Python ([HTML-Output](topic_models_en.html))
+- [Netzwerkanalyse in Python](Netzwerkanalyse_de.ipynb), inklusive mathematischer Erklärung von Zentralitätsmaßen ([HTML-Output](Netzwerkanalyse_de.html))
